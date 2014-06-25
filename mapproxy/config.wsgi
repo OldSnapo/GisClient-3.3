@@ -175,17 +175,22 @@ class AuthProxy(object):
         self.conf = {}
 
     def __call__(self, environ, start_response):
-        self._load_configuation(environ)
-        cookies = self.load_auth(environ)
+
         query = _parse_query_string(environ['QUERY_STRING'])
-        # TODO: capire perché :-)
-        environ['wfs'] = WFSProxy(self.app_name, self.conf['sources']['mapserver_source']['mapserver'])
-        another_start_response = lambda s,h: start_response(s, h+cookies)
 
         # TEST ###
         if 'TEST' in query:
-            return self._test(query['TEST'].lower(), environ, another_start_response)
+            return self._test(query['TEST'].lower(), environ, start_response)
         # ###
+
+        self._load_configuation(environ)
+        # 1. if configuration cannot be loaded use basic app
+        if self.conf is None: return self.app(environ, start_response)
+        # TODO: capire perché :-)
+        environ['wfs'] = WFSProxy(self.app_name, self.conf['sources']['mapserver_source']['mapserver'])
+        cookies = self.load_auth(environ)
+        # proxy cookies
+        another_start_response = lambda s,h: start_response(s, h+cookies)
 
         environ['mapproxy.authorize'] = self.authorize # authorize callback
         service = query['SERVICE'].upper() if 'SERVICE' in query else None
@@ -204,14 +209,23 @@ class AuthProxy(object):
         if value == 'gcmap':
             headers['Content-Type'] = 'text/json'
             out = jsdumps(self._test_gcmap(environ))
+        if value == 'conf':
+            out = jsdumps(self.conf["layers"])
 
         start_response('200 OK', headers.items())
         return [out]
 
     def _load_configuation(self, environ):
         """ Loads app configuration from file """
-        self.app_name = environ['REQUEST_URI'].split('?')[0].split('/')[2]
-        self.conf = load_yaml_file(self.app.loader.app_conf(self.app_name)['mapproxy_conf'])
+        self.conf = None
+        url_parts = [p for p in environ['REQUEST_URI'].split('?')[0].split('/') if p]
+        if len(url_parts)>1:
+            self.app_name = url_parts[2]
+            app_conf = self.app.loader.app_conf(self.app_name)
+            if not app_conf is None:
+                self.conf = load_yaml_file(app_conf['mapproxy_conf'])
+            else:
+                self.conf = None
 
     def _test_gcmap(self, environ):
         """ WARNING: for TEST only """
@@ -329,12 +343,21 @@ class AuthProxy(object):
     def get_ordered_layers(self):
         """ Returns WMS layer iterator """
 
-        for layer in self.conf["layers"]:
-            if not 'layers' in layer:
-                yield layer['name']
-            else:
-                for sub_layer in layer['layers']:
-                    yield sub_layer['name']
+        if isinstance(self.conf["layers"], dict):
+            for layer,info in self.conf["layers"].items():
+                if not 'layers' in info:
+                    yield layer
+                else:
+                    for sub_layer in info['layers']:
+                        yield sub_layer['name']
+        else:
+            # for backward compatibility with hand-made conf file
+            for layer in self.conf["layers"]:
+                if not 'layers' in layer:
+                    yield layer['name']
+                else:
+                    for sub_layer in layer['layers']:
+                        yield sub_layer['name']
 
     def authorize(self, service, layers=[], environ=None, **kw):
         """ The auth callback """
