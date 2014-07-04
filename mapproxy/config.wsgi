@@ -8,9 +8,6 @@
 # import os.path
 # fileConfig(r'/opt/mapproxy/gwmapproxy/log.ini', {'here': os.path.dirname(__file__)})
 
-
-#!!!!!!!!!!!!!!!!!!!!!! AGGIUNGERE MODULO REQUESTS
-
 #from mapproxy.wsgiapp import make_wsgi_app
 #application = make_wsgi_app(r'/opt/mapproxy/gwmapproxy/mapproxy.yaml')
 
@@ -18,7 +15,10 @@
 activate_this = '/home/plone/Plone/Python-2.7/bin/activate_this.py'
 execfile(activate_this, dict(__file__=activate_this))
 
+from mapproxy.multiapp import make_wsgi_app
+from beaker.middleware import SessionMiddleware
 from mapproxy.util.yaml import load_yaml_file
+import mapproxy.config.config
 from mapproxy.multiapp import make_wsgi_app
 from mapproxy.client.cgi import CGIClient
 from mapproxy.service.wms import PERMIT_ALL_LAYERS
@@ -30,47 +30,6 @@ from json import loads as jsloads
 import Cookie
 import requests
 import os.path
-
-class SimpleAuthFilter(object):
-    """
-    Simple MapProxy authorization middleware.
-
-    It authorizes WMS requests for layers where the name does
-    not start with `prefix`.
-    """
-    def __init__(self, app, prefix='secure'):
-        self.app = app
-        self.prefix = prefix
-
-    def __call__(self, environ, start_response):
-        # put authorize callback function into environment
-        environ['mapproxy.authorize'] = self.authorize
-        return self.app(environ, start_response)
-
-    def authorize(self, service, layers=[], environ=None, **kw):
-        allowed = denied = False
-        if service.startswith('wms.'):
-            auth_layers = {}
-            for layer in layers:
-                if layer.startswith(self.prefix):
-                    auth_layers[layer] = {}
-                    denied = True
-                else:
-                    auth_layers[layer] = {
-                        'map': True,
-                        'featureinfo': True,
-                        'legendgraphic': True,
-                    }
-                    allowed = True
-        else: # other services are allowed
-          return {'authorized': 'true'}
-
-        if allowed and not denied:
-            return {'authorized': 'full'}
-        if denied and not allowed:
-            return {'authorized': 'none'}
-        return {'authorized': 'partial', 'layers': auth_layers}
-
 
 def _parse_query_string(qstring):
 
@@ -88,38 +47,182 @@ def _get_query_string(query, **kw):
     query.update(kw)
     return unquote(urlencode(query))
 
-class WFSProxy(object):
+class BaseProxy(object):
+    """ """
 
-    def __init__(self, app_name, msconf):
+    def setup(self, environ):
+        """ """
+        uri = [p for p in environ['REQUEST_URI'].split('?')[0].split('/') if p]
+        if len(uri)>1:
+            self.mapset = uri[1]
+            #self.session(environ=environ)
+        self.service = None if len(uri)<=2 else uri[2]
+        return uri
 
+class SessionProxy(BaseProxy):
+    """ """
+
+    _session = None # Session dict dedicated to the requested mapset
+    __session = None # The whole session
+    first_call = True
+    service = None
+    conf = None
+
+    def setup(self, environ):
+        """ """
+        uri = BaseProxy.setup(self, environ)
+        self.session(environ=environ)
+        return uri
+
+    def session(self, *args, **kw):
+        """ Session management for setting/extract values.
+        Returns single value or generator.
+        """
+        environ = None if not 'environ' in kw else kw.pop('environ')
+
+        # Session setup
+        if self._session is None:
+            session = environ['beaker.session']
+            if not self.mapset in session:
+                session[self.mapset] = dict()
+            self.__session = session
+            self._session = session[self.mapset]
+
+        # Setting values in session
+        for key, value in kw.items():
+            self._session[key] = value
+        if len(kw)>0: self.__session.save()
+
+        if len(args)==0:
+            return self._session
+
+        out = (self._session.get(k) for k in args)
+        if len(args)==1:
+            return out.next()
+        else:
+            return out
+
+    def load_configuation(self, environ):
+        """ Loads app configuration """
+        if 'conf' in self._session:
+            self.conf = self.session('conf')
+        else:
+            app_conf = self.app.loader.app_conf(self.mapset)
+            assert not app_conf is None, "Warning! No configuration found related to requested application: %s" % self.mapset
+            assert os.path.isfile(app_conf['mapproxy_conf']), "Warning! No file found: %s" % app_conf['mapproxy_conf']
+            conf = load_yaml_file(app_conf['mapproxy_conf'])
+            assert conf, "Warning! Configuration file cannot be loaded (%s)" % app_conf['mapproxy_conf']
+            self.session(conf = conf)
+            self.conf = self._session['conf']
+
+class LoginProxy(SessionProxy):
+    """ """
+    auth = dict(wms={}, wfs={})
+
+    def __call__(self, environ, start_response=None, reset=True):
+        self.setup(environ)
+        self.load_auth(environ, reset=reset)
+        if not start_response is None:
+            start_response('200 OK', [('Content-Type', 'text/ascii')])
+        return ['Authorization info updated!']
+
+    def _update_wms_auth(self, name, parameters=None, nodes=None, options=None,
+        map=True, featureinfo=True, legendgraphic=True, **kw
+    ):
+        """ """
+        permits = {
+            'map': map,
+            'featureinfo': featureinfo,
+            'legendgraphic': legendgraphic
+        }
+        main_key = name
+        singleTile = (not options is None and options.get('singleTile')==True)
+        if not nodes is None:
+            for layer_info in nodes:
+                if singleTile:
+                    key = layer_info['layer']
+                else:
+                    key = '.'.join((name, layer_info['layer'], ))
+                self.auth['wms'][key] = permits
+
+        if singleTile:
+            main_key += '_tiles'
+        self.auth['wfs'][main_key] = permits
+
+    def load_auth(self, environ, reset=False):
+        """ """
+        if reset or not 'auth' in self._session:
+            self._init_auth(environ)
+        else:
+            self.auth = self._session['auth']
+            self.first_call = False
+
+    def _call_gcmap(self, environ):
+        """ Query the gcmap service. Returns dictionary """
+        url = '%(wsgi.url_scheme)s://%(SERVER_NAME)s/gisclient/services/gcmap.php' % environ
+        data = dict(parse_qs(environ['QUERY_STRING']), mapset=self.mapset)
+        result = requests.post(url, data=data)
+        assert result.status_code==200, result.text
+        return result.json()
+
+    def _init_auth(self, environ):
+        """ Load the authorization information from gcmap service """
+        self.auth = LoginProxy.auth # reset the auth value
+        result = self._call_gcmap(environ)
+        # WMS
+        for authorized_layer in result['layers']:
+            # TODO: distinguere i diversi permessi possibili:
+            #       map, featureinfo, legendgraphic
+            # Per ora abilito o tutto o niente
+            # WARNING: l'autorizzazione nel caso WMS ha forma standard!!
+            self._update_wms_auth(**authorized_layer)
+        # WFS
+        for authorized_layer in result['featureTypes']:
+            # TODO: distinguere i diversi permessi possibili:
+            #       quali??
+            # Per ora abilito o tutto o niente
+            self.auth['wfs'][authorized_layer['typeName']] = {
+                'feature': True,
+            }
+        # Update values in session
+        self.session(auth=self.auth)
+        return True
+
+class WFSProxy(SessionProxy):
+    """ """
+
+    def setup(self, environ):
+        SessionProxy.setup(self, environ)
+        self.load_configuation(environ)
+        msconf = self.conf['sources']['mapserver_source']['mapserver']
         self.bin = msconf['binary']
         self.working_directory = msconf['working_dir']
-        self.map = os.path.join(msconf['working_dir'], app_name) + '.map'
 
-    def __call__(self, environ, start_response):
-        """ The WFS proxy service """
-        query = _parse_query_string(environ['QUERY_STRING'])
-
-        requested_layers = self._get_requested_layer_list(query)
-        authorized_layers, _ = self.authorized_layers('feature', [], environ, None)
-
-        #start_response('200 OK', [('Content-Type', "text/ascii")])
-        #return [jsdumps(authorized_layers)]
-        filtered_layers, key = self.filter_requested_layers(query, authorized_layers)
-        if not key is None:
-            kw = {key: filtered_layers}
-            query_string = _get_query_string(query, map = self.map, **kw)
-        else:
-            query_string = _get_query_string(query, map = self.map)
+    def call_mapserver(self, query):
+        filtered_layers = self.get_filtered_layers(query)
+        query_string = _get_query_string(query, map = '%s.map' %self.mapset, **filtered_layers)
 
         url = "http://localhost?" + query_string
         client = CGIClient(script=self.bin, working_directory=self.working_directory)
-        res = client.open(url=url)
+        return client.open(url=url)
+
+    def __call__(self, environ, start_response):
+        """ The WFS proxy service """
+
+        self.setup(environ)
+        query = _parse_query_string(environ['QUERY_STRING'])
+
+        res = self.call_mapserver(query)
         content_type = res.headers.get('Content-type') or "text/ascii"
         start_response('200 OK', [('Content-Type', content_type)])
         return [res.getvalue()]
 
-    def _get_requested_layer_list(self, query):
+    def get_filtered_layers(self, query):
+        """ TODO """
+        return self.get_requested_layers(query)
+
+    def get_requested_layers(self, query):
+        """ Returns dict. """
         if "VERSION" in query and query["VERSION"] > "1.1.0":
             layer_key = "TYPENAMES"
         else:
@@ -128,18 +231,11 @@ class WFSProxy(object):
         if layer_key in query:
             res = query[layer_key]
             if isinstance(res, (list, tuple, )):
-                return res, layer_key
+                return {layer_key: res}
             else:
-                return [res], layer_key
+                return {layer_key: [res]}
         else:
-            return [], None
-
-    def filter_requested_layers(self, query, authorized_layers):
-        requested_layers, key = self._get_requested_layer_list(query)
-        if authorized_layers is PERMIT_ALL_LAYERS:
-            return [l for l in requested_layers], key
-        else:
-            return [l for l in requested_layers if l in authorized_layers], key
+            return {}
 
     def authorized_layers(self, feature, layers, env, query_extent):
         """ Courtesy of mapproxy.service.WMSServer.authorized_layers """
@@ -164,200 +260,65 @@ class WFSProxy(object):
         else:
             return PERMIT_ALL_LAYERS, None
 
-class AuthProxy(object):
-
-    wfs_auth = {}
-    wms_auth = {}
-    cname = 'wms_layer_auth'
+class AuthProxy(LoginProxy):
+    """ """
 
     def __init__(self, app):
         self.app = app
-        self.conf = {}
 
-    def __call__(self, environ, start_response):
-
-        query = _parse_query_string(environ['QUERY_STRING'])
-
-        # TEST ###
-        if 'TEST' in query:
-            return self._test(query['TEST'].lower(), environ, start_response)
-        # ###
-
-        self._load_configuation(environ)
-        # 1. if configuration cannot be loaded use basic app
-        if self.conf is None: return self.app(environ, start_response)
-        # TODO: capire perché :-)
-        environ['wfs'] = WFSProxy(self.app_name, self.conf['sources']['mapserver_source']['mapserver'])
-        cookies = self.load_auth(environ)
-        # proxy cookies
-        another_start_response = lambda s,h: start_response(s, h+cookies)
-
-        environ['mapproxy.authorize'] = self.authorize # authorize callback
-        service = query['SERVICE'].upper() if 'SERVICE' in query else None
-        if service=='WFS':
-            return environ['wfs'](environ, another_start_response)
-        else:
-            return self.app(environ, another_start_response)
-
-    def _test(self, value, environ, start_response, cookies=[], **kw):
-        # WARNING: just a helper function with development porposes
-        headers = {'Content-Type': 'text/ascii'}
-        if value == 'url':
-            out = self._get_auth_info_from_gcmap(environ)
-        if value == 'env':
-            out = str(environ)
-        if value == 'gcmap':
-            headers['Content-Type'] = 'text/json'
-            out = jsdumps(self._test_gcmap(environ))
+    def _TEST_(self, value, environ, start_response, **kw):
+        """ """
+        ct = 'json'
+        headers = lambda ct: {'Content-Type': 'text/%s' % ct}
+        if value == 'auth':
+            if len(self.auth['wms'])==0:
+                self.load_auth(environ)
+            out = jsdumps(dict(first_call=self.first_call, auth=self.auth))
         if value == 'conf':
-            out = jsdumps(self.conf["layers"])
-
-        start_response('200 OK', headers.items())
+            out = jsdumps(dict(first_call=self.first_call, conf=self.conf))
         return [out]
 
-    def _load_configuation(self, environ):
-        """ Loads app configuration from file """
-        self.conf = None
-        url_parts = [p for p in environ['REQUEST_URI'].split('?')[0].split('/') if p]
-        if len(url_parts)>1:
-            self.app_name = url_parts[2]
-            app_conf = self.app.loader.app_conf(self.app_name)
-            if not app_conf is None:
-                self.conf = load_yaml_file(app_conf['mapproxy_conf'])
-            else:
-                self.conf = None
+    def setup(self, environ):
+        self.login = LoginProxy()
+        return LoginProxy.setup(self, environ)
 
-    def _test_gcmap(self, environ):
-        """ WARNING: for TEST only """
-        res = self._get_auth_info_from_gcmap(environ, cookie=None)
-
-        if res.status_code==200:
-            return res.json()
-        else:
-            return res.text
-
-    def _get_auth_info_from_gcmap(self, environ, cookie=None):
-        """ Query the gcmap service and returns the loaded json result """
-        url = '%(wsgi.url_scheme)s://%(SERVER_NAME)s/gisclient/services/gcmap.php' % environ
-        data = dict(mapset=self.app_name)
-        if not cookie is None and 'gisclient3' in cookie:
-            data['gisclient3'] = cookie['gisclient3'].value
-            self.cname = cookie['gisclient3'].value
-        result = requests.post(url, data=data)
-        return result
-
-    def load_auth(self, environ):
-        """ TODO
-        Load the authorization informations into wms_auth and wfs_auth parameters.
-        Returns cookie string.
-        """
-        # ### TODO ###: se non esiste scrivere la informazioni di autorizzazione
-        # dei layer in un cookie e restituire il valore del cookie se esiste invece
-        # di fare la chiamata tutte le volte
-        cookie = Cookie.SimpleCookie()
-        if 'HTTP_COOKIE' in environ:
-            cookie.load(environ['HTTP_COOKIE'])
-
-        if not 'gisclient3' in cookie or cookie['gisclient3'].value in cookie:
-            if not self.cname in cookie:
-                self.load_auth_from_gcmap(environ, cookie)
-                cookie[self.cname] = self.get_wms_auth_string()
-            else:
-                self.load_auth_from_cookie(cookie)
-        else:
-            self.load_auth_from_gcmap(environ, cookie)
-            cookie[self.cname] = self.get_wms_auth_string()
-
-        return [tuple(str(cookie[self.cname]).split(': '))]
-
-    def load_auth_from_cookie(self, cookie):
-        """ Load the authorization informations into wms_auth (TODO: and wfs_auth)
-        parameter from cookie
-        """
-        auths = cookie[self.cname].value
-        for n, layer in enumerate(self.get_ordered_layers()):
-            bin_auth = '{0:03b}'.format(int(auths[n])) # dec(1) -> bin(3)
-            bool_auth = (bool(int(i)) for i in bin_auth)
-            if any(bool_auth):
-                self.wms_auth[layer] = dict((k,v) for k,v in zip(('legendgraphic', 'featureinfo', 'map', ), bool_auth) if v)
-
-    def get_wms_auth_string(self):
+    def __call__(self, environ, start_response):
         """ """
-        # TODO: codificare i diversi permessi considerando le combinazioni di
-        # 3 cifre binarie come interi da 0 (-> 000) a 7 (-> 111)
-        # per ora considero solo gli estremi 0 (tutto negato) e 7 (tutto permesso).
-        value = ''
-        for layer in self.get_ordered_layers():
-            if layer in self.wms_auth:
-                value += '7'
-            else:
-                value += '0'
-        return value
+        url_parts = self.setup(environ)
+        query = _parse_query_string(environ['QUERY_STRING'])
 
-    def load_auth_from_gcmap(self, environ, cookie):
-        """ Load the authorization informations into wms_auth and wfs_auth
-        parameters from gcmap service
-        """
+        # 1. if no specific app name given use the basic app
+        if self.service is None and not query: return self.app(environ, start_response)
 
-        def _append_wms(name, parameters=None, options=None,
-            map=True, featureinfo=True, legendgraphic=True, **kw):
-            """ """
-            permits = {
-                'map': map,
-                'featureinfo': featureinfo,
-                'legendgraphic': legendgraphic
-            }
-            main_key = name
-            singleTile = False
-            if not parameters is None and 'layers' in parameters:
-                singleTile = (not options is None and options.get('singleTile')==True)
-                for layer in parameters['layers']:
-                    if singleTile:
-                        key = layer
-                    else:
-                        key = '.'.join((name, layer, ))
-                    self.wms_auth[key] = permits
-            if singleTile:
-                main_key += '_tiles'
-            self.wms_auth[main_key] = permits
+        # 2.
+        if self.service=='login': return self.login(environ, start_response)
+        # 3.
+        if self.service=='gcmap':
+            start_response('200 OK', [('Content-Type', 'text/json')])
+            return [jsdumps(self._call_gcmap(environ))]
 
-        res = self._get_auth_info_from_gcmap(environ, cookie)
-        if res.status_code==200:
-            result = res.json()
-            # WMS
-            for authorized_layer in result['layers']:
-                # TODO: distinguere i diversi permessi possibili:
-                #       map, featureinfo, legendgraphic
-                # Per ora abilito o tutto o niente
-                # WARNING: l'autorizzazione nel caso WMS ha forma standard!!
-                _append_wms(**authorized_layer)
-            # WFS
-            for authorized_layer in result['featureTypes']:
-                # TODO: distinguere i diversi permessi possibili:
-                #       quali??
-                # Per ora abilito o tutto o niente
-                self.wfs_auth[authorized_layer['typeName']] = {
-                    'feature': True,
-                }
+        self.load_configuation(environ)
 
-    def get_ordered_layers(self):
-        """ Returns WMS layer iterator """
+        # TODO: per ora evito questioni di autorizzazione.
+        # self.load_auth(environ)
 
-        if isinstance(self.conf["layers"], dict):
-            for layer,info in self.conf["layers"].items():
-                if not 'layers' in info:
-                    yield layer
-                else:
-                    for sub_layer in info['layers']:
-                        yield sub_layer['name']
+        # ### TEST
+        if 'TEST' in query:
+            return self._TEST_(query['TEST'].lower(), environ, start_response)
+        # ###
+
+        # TODO
+        environ['wfs'] = WFSProxy()
+        service = query['SERVICE'].upper() if 'SERVICE' in query else None
+        # 4.
+        if service=='WFS':
+            return environ['wfs'](environ, start_response)
         else:
-            # for backward compatibility with hand-made conf file
-            for layer in self.conf["layers"]:
-                if not 'layers' in layer:
-                    yield layer['name']
-                else:
-                    for sub_layer in layer['layers']:
-                        yield sub_layer['name']
+            return self.app(environ, start_response)
+
+    def load_auth(self, environ, reset=False):
+        LoginProxy.load_auth(self, environ, reset)
+        environ['mapproxy.authorize'] = self.authorize # authorize callback
 
     def authorize(self, service, layers=[], environ=None, **kw):
         """ The auth callback """
@@ -366,9 +327,7 @@ class AuthProxy(object):
         # ### {'authorized': 'unauthenticated'} ###
 
         # ### TEST ###
-        uri = environ['REQUEST_URI'].split('?')[0].split('/')
-        if len(uri)>3 and uri[3]=='demo':
-            return {'authorized': 'full'}
+        if self.service=='demo': return {'authorized': 'full'}
         # ###
 
         allowed = denied = False
@@ -389,27 +348,19 @@ class AuthProxy(object):
             return {'authorized': 'none'}
         return {'authorized': 'partial', 'layers': auth_layers}
 
-class SimpleRequestFilter(object):
-    """ WARNING: Not used """
-
-    def __init__(self, app):
-        self.app = app
-
-    def __call__(self, environ, start_response):
-        # Add the callback to the WSGI environment
-
-        query = _parse_query_string(environ['QUERY_STRING'])
-        environ['wfs'] = WFSProxy
-
-        asked_for_wfs = 'SERVICE' in query and query['SERVICE'].upper()=='WFS'
-
-        if not asked_for_wfs:
-            return self.app(environ, start_response)
-        else:
-            proxy = WFSProxy(environ, self.app)
-            return proxy(query, start_response)
-
 config_dir = '/apps/GisClient-3.3/mapproxy/'
-from mapproxy.multiapp import make_wsgi_app
 application = make_wsgi_app(config_dir, allow_listing=True)
-#application = AuthProxy(application)
+application = AuthProxy(application)
+# Configure the SessionMiddleware
+session_opts_1 = {
+    'session.data_dir': '/tmp',
+    'session.type': 'file',
+    'session.cookie_expires': True,
+}
+session_opts_2 = {
+    'session.type': 'ext:memcached',
+    'session.url': '127.0.0.1:11211',
+    'session.lock_dir': '/tmp',
+    'session.cookie_expires': True,
+}
+application = SessionMiddleware(application, session_opts_2)
