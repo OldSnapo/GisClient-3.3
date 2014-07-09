@@ -50,6 +50,8 @@ def _get_query_string(query, **kw):
 class BaseProxy(object):
     """ """
 
+    mapset = None
+
     def setup(self, environ):
         """ """
         uri = [p for p in environ['REQUEST_URI'].split('?')[0].split('/') if p]
@@ -83,10 +85,11 @@ class SessionProxy(BaseProxy):
         # Session setup
         if self._session is None:
             session = environ['beaker.session']
-            if not self.mapset in session:
+            if not self.mapset is None and not self.mapset in session:
                 session[self.mapset] = dict()
+            elif not self.mapset is None:
+                self._session = session[self.mapset]
             self.__session = session
-            self._session = session[self.mapset]
 
         # Setting values in session
         for key, value in kw.items():
@@ -104,7 +107,7 @@ class SessionProxy(BaseProxy):
 
     def load_configuation(self, environ):
         """ Loads app configuration """
-        if 'conf' in self._session:
+        if not self._session is None and 'conf' in self._session:
             self.conf = self.session('conf')
         else:
             app_conf = self.app.loader.app_conf(self.mapset)
@@ -112,7 +115,9 @@ class SessionProxy(BaseProxy):
             assert os.path.isfile(app_conf['mapproxy_conf']), "Warning! No file found: %s" % app_conf['mapproxy_conf']
             conf = load_yaml_file(app_conf['mapproxy_conf'])
             assert conf, "Warning! Configuration file cannot be loaded (%s)" % app_conf['mapproxy_conf']
-            self.session(conf = conf)
+            if self._session is None:
+                self.session(environ=environ)
+            self.session(conf=conf)
             self.conf = self._session['conf']
 
 class LoginProxy(SessionProxy):
@@ -127,9 +132,9 @@ class LoginProxy(SessionProxy):
         return ['Authorization info updated!']
 
     def _update_wms_auth(self, name, parameters=None, nodes=None, options=None,
-        map=True, featureinfo=True, legendgraphic=True, **kw
-    ):
+        map=True, featureinfo=True, legendgraphic=True, **kw):
         """ """
+
         permits = {
             'map': map,
             'featureinfo': featureinfo,
@@ -147,7 +152,7 @@ class LoginProxy(SessionProxy):
 
         if singleTile:
             main_key += '_tiles'
-        self.auth['wfs'][main_key] = permits
+        self.auth['wms'][main_key] = permits
 
     def load_auth(self, environ, reset=False):
         """ """
@@ -271,11 +276,18 @@ class AuthProxy(LoginProxy):
         ct = 'json'
         headers = lambda ct: {'Content-Type': 'text/%s' % ct}
         if value == 'auth':
+            if self.conf is None:
+                self.load_configuation(environ)
             if len(self.auth['wms'])==0:
                 self.load_auth(environ)
             out = jsdumps(dict(first_call=self.first_call, auth=self.auth))
         if value == 'conf':
+            if self.conf is None:
+                self.load_configuation(environ)
             out = jsdumps(dict(first_call=self.first_call, conf=self.conf))
+        else:
+            out = jsdumps(getattr(self, value))
+        start_response('200 OK', headers(ct).items())
         return [out]
 
     def setup(self, environ):
@@ -287,25 +299,29 @@ class AuthProxy(LoginProxy):
         url_parts = self.setup(environ)
         query = _parse_query_string(environ['QUERY_STRING'])
 
+        # ### TEST
+        if 'TEST' in query:
+            return self._TEST_(query['TEST'].lower(), environ, start_response)
+        # ###
+
         # 1. if no specific app name given use the basic app
-        if self.service is None and not query: return self.app(environ, start_response)
+        if self.service=='demo' or (self.service is None and not query):
+            return self.app(environ, start_response)
 
         # 2.
         if self.service=='login': return self.login(environ, start_response)
         # 3.
         if self.service=='gcmap':
-            start_response('200 OK', [('Content-Type', 'text/json')])
+            start_response('200 OK', [
+                ('Content-Type', 'application/json'),
+                ('Charset', 'UTF-8')
+            ])
             return [jsdumps(self._call_gcmap(environ))]
 
         self.load_configuation(environ)
 
         # TODO: per ora evito questioni di autorizzazione.
-        # self.load_auth(environ)
-
-        # ### TEST
-        if 'TEST' in query:
-            return self._TEST_(query['TEST'].lower(), environ, start_response)
-        # ###
+        self.load_auth(environ)
 
         # TODO
         environ['wfs'] = WFSProxy()
@@ -322,6 +338,10 @@ class AuthProxy(LoginProxy):
 
     def authorize(self, service, layers=[], environ=None, **kw):
         """ The auth callback """
+
+        # ### TEST ###
+        return {'authorized': 'full'}
+        # ###
 
         # TODO: considerare l'opzione utente non-autenticato se utile
         # ### {'authorized': 'unauthenticated'} ###
@@ -352,15 +372,15 @@ config_dir = '/apps/GisClient-3.3/mapproxy/'
 application = make_wsgi_app(config_dir, allow_listing=True)
 application = AuthProxy(application)
 # Configure the SessionMiddleware
-session_opts_1 = {
+file_session_opts = {
     'session.data_dir': '/tmp',
     'session.type': 'file',
     'session.cookie_expires': True,
 }
-session_opts_2 = {
+cm_session_opts = {
     'session.type': 'ext:memcached',
     'session.url': '127.0.0.1:11211',
     'session.lock_dir': '/tmp',
     'session.cookie_expires': True,
 }
-application = SessionMiddleware(application, session_opts_2)
+application = SessionMiddleware(application, file_session_opts)
