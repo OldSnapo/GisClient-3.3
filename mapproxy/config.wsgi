@@ -56,8 +56,8 @@ class BaseProxy(object):
         """ """
         uri = [p for p in environ['REQUEST_URI'].split('?')[0].split('/') if p]
         if len(uri)>1:
+            # TODO: rename self.mapset in self.project
             self.mapset = uri[1]
-            #self.session(environ=environ)
         self.service = None if len(uri)<=2 else uri[2]
         return uri
 
@@ -105,21 +105,6 @@ class SessionProxy(BaseProxy):
         else:
             return out
 
-    def load_configuation(self, environ):
-        """ Loads app configuration """
-        if not self._session is None and 'conf' in self._session:
-            self.conf = self.session('conf')
-        else:
-            app_conf = self.app.loader.app_conf(self.mapset)
-            assert not app_conf is None, "Warning! No configuration found related to requested application: %s" % self.mapset
-            assert os.path.isfile(app_conf['mapproxy_conf']), "Warning! No file found: %s" % app_conf['mapproxy_conf']
-            conf = load_yaml_file(app_conf['mapproxy_conf'])
-            assert conf, "Warning! Configuration file cannot be loaded (%s)" % app_conf['mapproxy_conf']
-            if self._session is None:
-                self.session(environ=environ)
-            self.session(conf=conf)
-            self.conf = self._session['conf']
-
 class LoginProxy(SessionProxy):
     """ """
     auth = dict(wms={}, wfs={})
@@ -131,9 +116,8 @@ class LoginProxy(SessionProxy):
             start_response('200 OK', [('Content-Type', 'text/ascii')])
         return ['Authorization info updated!']
 
-    def _update_wms_auth(self, name, parameters=None, nodes=None, options=None,
-        map=True, featureinfo=True, legendgraphic=True, **kw):
-        """ """
+    def _update_wms_auth(self, name, parameters=None, nodes=None, options=None, map=True, featureinfo=True, legendgraphic=True, **kw):
+        """ DEPRECATED """
 
         permits = {
             'map': map,
@@ -162,16 +146,32 @@ class LoginProxy(SessionProxy):
             self.auth = self._session['auth']
             self.first_call = False
 
-    def _call_gcmap(self, environ):
-        """ Query the gcmap service. Returns dictionary """
-        url = '%(wsgi.url_scheme)s://%(SERVER_NAME)s/gisclient/services/gcmap.php' % environ
+    #def _call_gcmap(self, environ):
+        #""" DEPRECATED: Query the gcmap service. Returns dictionary """
+        #url = '%(wsgi.url_scheme)s://%(SERVER_NAME)s/gisclient/services/gcmap.php' % environ
+        #data = dict(parse_qs(environ['QUERY_STRING']), mapset=self.mapset)
+        #result = requests.post(url, data=data)
+        #assert result.status_code==200, result.text
+        #return result.json()
+
+    def _call_gcauth(self, environ):
+        """ Query the gcauthorized service. Returns dictionary """
+        url = '%(wsgi.url_scheme)s://%(SERVER_NAME)s/gisclient/services/gcauthorized.php' % environ
         data = dict(parse_qs(environ['QUERY_STRING']), mapset=self.mapset)
         result = requests.post(url, data=data)
         assert result.status_code==200, result.text
         return result.json()
 
     def _init_auth(self, environ):
-        """ Load the authorization information from gcmap service """
+        """ Load the authorization information from gcauthorized service """
+        self.auth = LoginProxy.auth # reset the auth value
+        self.auth = self._call_gcauth(environ)
+        # Update values in session
+        self.session(environ=environ, auth=self.auth)
+        return True
+
+    def _init_auth_old(self, environ):
+        """ DEPRECATED: Load the authorization information from gcmap service """
         self.auth = LoginProxy.auth # reset the auth value
         result = self._call_gcmap(environ)
         # WMS
@@ -196,12 +196,30 @@ class LoginProxy(SessionProxy):
 class WFSProxy(SessionProxy):
     """ """
 
+    def load_configuation(self, environ):
+        """ Loads app configuration """
+        # ### TODO ###
+        # spostare alla sola classe WFS per il caricamento delle
+        # configurazioni di mapserver
+        # ###
+        #if not self._session is None and 'conf' in self._session:
+            #self.conf = self.session('conf')
+        #else:
+            #app_conf = self.app.loader.app_conf(self.mapset)
+            #assert not app_conf is None, "Warning! No configuration found related to requested application: %s" % self.mapset
+            #assert os.path.isfile(app_conf['mapproxy_conf']), "Warning! No file found: %s" % app_conf['mapproxy_conf']
+            #conf = load_yaml_file(app_conf['mapproxy_conf'])
+            #assert conf, "Warning! Configuration file cannot be loaded (%s)" % app_conf['mapproxy_conf']
+            #if self._session is None:
+                #self.session(environ=environ)
+            #self.session(conf=conf)
+            #self.conf = self._session['conf']
+        self.bin = "/usr/lib/cgi-bin/mapserv"
+        self.working_directory = "/apps/GisClient-3.3/map/geoweb_genova"
+
     def setup(self, environ):
         SessionProxy.setup(self, environ)
         self.load_configuation(environ)
-        msconf = self.conf['sources']['mapserver_source']['mapserver']
-        self.bin = msconf['binary']
-        self.working_directory = msconf['working_dir']
 
     def call_mapserver(self, query):
         filtered_layers = self.get_filtered_layers(query)
@@ -276,15 +294,9 @@ class AuthProxy(LoginProxy):
         ct = 'json'
         headers = lambda ct: {'Content-Type': 'text/%s' % ct}
         if value == 'auth':
-            if self.conf is None:
-                self.load_configuation(environ)
             if len(self.auth['wms'])==0:
-                self.load_auth(environ)
+                self.load_auth(environ, reset=True)
             out = jsdumps(dict(first_call=self.first_call, auth=self.auth))
-        if value == 'conf':
-            if self.conf is None:
-                self.load_configuation(environ)
-            out = jsdumps(dict(first_call=self.first_call, conf=self.conf))
         else:
             out = jsdumps(getattr(self, value))
         start_response('200 OK', headers(ct).items())
@@ -311,14 +323,15 @@ class AuthProxy(LoginProxy):
         # 2.
         if self.service=='login': return self.login(environ, start_response)
         # 3.
-        if self.service=='gcmap':
+        if self.service in ('gcmap', 'gcauth', 'gcauthorized'):
             start_response('200 OK', [
                 ('Content-Type', 'application/json'),
                 ('Charset', 'UTF-8')
             ])
-            return [jsdumps(self._call_gcmap(environ))]
+            return [jsdumps(self._call_gcauth(environ))]
 
-        self.load_configuation(environ)
+        # DEPRECATED
+        #self.load_configuation(environ)
 
         # TODO: per ora evito questioni di autorizzazione.
         self.load_auth(environ)
@@ -334,13 +347,25 @@ class AuthProxy(LoginProxy):
 
     def load_auth(self, environ, reset=False):
         LoginProxy.load_auth(self, environ, reset)
-        environ['mapproxy.authorize'] = self.authorize # authorize callback
+        environ['mapproxy.authorize'] = self.proxy_authorize # authorize callback
 
-    def authorize(self, service, layers=[], environ=None, **kw):
-        """ The auth callback """
+    def proxy_authorize(self, service, *args, **kw):
+        """ """
 
         # ### TEST ###
-        return {'authorized': 'full'}
+        if self.service=='demo': return {'authorized': 'full'}
+        # ###
+
+        if service.startswith('wms.'):
+            return self.auth['wms']
+        else:
+            return {'authorized': 'full'}
+
+    def authorize(self, service, layers=[], environ=None, **kw):
+        """ DEPRECATED The auth callback """
+
+        # ### TEST ###
+        #return {'authorized': 'full'}
         # ###
 
         # TODO: considerare l'opzione utente non-autenticato se utile
