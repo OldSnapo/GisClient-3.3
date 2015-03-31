@@ -4,16 +4,21 @@
 
 # # uncomment the following lines for logging
 # # create a log.ini with `mapproxy-util create -t log-ini`
-# from logging.config import fileConfig
-# import os.path
-# fileConfig(r'/opt/mapproxy/gwmapproxy/log.ini', {'here': os.path.dirname(__file__)})
+from logging.config import fileConfig
+import os.path
+fileConfig(r'/srv/geoweb/GisClient-3.3/mapproxy/log.ini', {'here': os.path.dirname(__file__)})
 
 #from mapproxy.wsgiapp import make_wsgi_app
 #application = make_wsgi_app(r'/opt/mapproxy/gwmapproxy/mapproxy.yaml')
 
-#activate_this = '/opt/wsgi-env/bin/activate_this.py'
-activate_this = '/home/plone/Plone/Python-2.7/bin/activate_this.py'
+activate_this = '/srv/mapproxy/bin/activate_this.py'
 execfile(activate_this, dict(__file__=activate_this))
+#from mapproxy.multiapp import make_wsgi_app
+#application = make_wsgi_app('/srv/geoweb/GisClient-3.3/mapproxy/', allow_listing=True)
+
+#activate_this = '/opt/wsgi-env/bin/activate_this.py'
+#activate_this = '/home/plone/Plone/Python-2.7/bin/activate_this.py'
+#execfile(activate_this, dict(__file__=activate_this))
 
 from mapproxy.multiapp import make_wsgi_app
 from beaker.middleware import SessionMiddleware
@@ -393,7 +398,7 @@ class AuthProxy(LoginProxy):
             return {'authorized': 'none'}
         return {'authorized': 'partial', 'layers': auth_layers}
 
-config_dir = '/apps/GisClient-3.3/mapproxy/'
+config_dir = '/srv/geoweb/GisClient-3.3/mapproxy/'
 application = make_wsgi_app(config_dir, allow_listing=True)
 application = AuthProxy(application)
 # Configure the SessionMiddleware

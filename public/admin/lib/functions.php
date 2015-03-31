@@ -87,14 +87,16 @@ $gMapMaxZoomLevels = array('G_HYBRID_MAP'=>19,'G_NORMAL_MAP'=>21,'G_PHYSICAL_MAP
 		return array_values(array_diff($aList,$ar));
 	}
 	
-	function array_index($aList, $value){
-		$retval=false;
-		for($i=0;$i<count($aList);$i++){
-			if($value<=$aList[$i]) $retval=$i;
+        function array_index($aList, $value){
+		$retval = false;
+		foreach($aList as $idxRes => $valRes){
+			if($value > $valRes){
+                            return $retval;
+                        }
+                        $retval = $idxRes;
 		}
 		return $retval;
 	}
-	
 	
 	function getResolutions($srid,$convFact,$maxRes=false,$minRes=false){
 		//se mercatore sferico setto le risoluzioni di google altrimenti uso quelle predefinite dall'elenco scale

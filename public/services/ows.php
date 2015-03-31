@@ -115,6 +115,7 @@ $parameterName = null;
 if($objRequest->getValueByName('service') == 'WMS') {
 	$parameterName = 'LAYERS';
 	$layersParameter = $objRequest->getValueByName('layers');
+        $layerIndexList = $objRequest->getValueByName('indexes');
 } else if($objRequest->getValueByName('service') == 'WFS') {
 	$parameterName = 'TYPENAME';
 	$layersParameter = $objRequest->getValueByName('typename');
@@ -159,9 +160,10 @@ if(!isset($_SESSION['GISCLIENT_USER_LAYER']) && !empty($layersParameter) && empt
 	}
 }
 
-if(!empty($layersParameter)) {
+if(!empty($layersParameter) || !empty($layerIndexList)) {
 	$layersArray = getRequestedLayers($layersParameter);
-	
+        $layersArray = array_merge($layersArray, getRequestedLayersById($layerIndexList));
+        
 	// stabilisco i layer da rimuovere (nascosti, privati e con filtri obbligatori non definiti) e applico i filtri
 	$layersToRemove = array();
 	$layersToInclude = array();
@@ -342,6 +344,9 @@ function checkLayer($project, $service, $layerName){
 function getRequestedLayers($layersParameter) {
 	global $oMap, $objRequest;
 	$layersArray = array();
+        if (empty($layersParameter)){
+            return $layersArray;
+        }
 	$layerNames = explode(',', $layersParameter);
 	// ciclo i layers e costruisco un array di singoli layers
 	foreach($layerNames as $name) {
@@ -358,6 +363,29 @@ function getRequestedLayers($layersParameter) {
 		} else {
 			array_push($layersArray, $oMap->getLayerByName($name));
 		}
+	}
+	return $layersArray;
+}
+
+function getRequestedLayersById($layersIdList) {
+	global $oMap, $objRequest;
+	$layersArray = array();
+        if (empty($layersIdList)){
+            return $layersArray;
+        }
+	$layerIds = explode(',', $layersIdList);
+	// ciclo i layers e costruisco un array di singoli layers
+	foreach($layerIds as $index) {
+                try{
+                    $layer = @$oMap->getLayer($index);
+                } 
+                catch (Exception $e) {
+                    $layer = false;
+                }
+                
+		if ($layer !== false ){
+                    array_push($layersArray, $layer);
+		}	
 	}
 	return $layersArray;
 }

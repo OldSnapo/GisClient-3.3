@@ -31,7 +31,7 @@ abstract class AbstractUser {
     }
     
     public function isAdmin($project = null) {
-        //$project serve a vedere se è admin del progetto
+        //$project serve a vedere se ï¿½ admin del progetto
         if(!$project) {
             return ($this->username == $this->adminUsername);
         } else {
@@ -135,10 +135,11 @@ abstract class AbstractUser {
             INNER JOIN '.DB_SCHEMA.'.mapset_layergroup using (layergroup_id)
             INNER JOIN '.DB_SCHEMA.'.layer USING (layergroup_id)
             LEFT JOIN '.DB_SCHEMA.'.layer_groups USING (layer_id)
-            WHERE ('.$sqlFilter.') AND ('.$authClause.') ORDER BY layer.layer_order;';
+            WHERE ('.$sqlFilter.') AND ('.$authClause.') ORDER BY layer.layer_order,layergroup.layergroup_order,layer.layer_name,layergroup.layergroup_name;';
         $stmt = $db->prepare($sql);
         $stmt->execute($sqlValues);
-        
+        print_debug($sql,null,'writemap');
+        $indexCount = 0;
 		while($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
 			$featureType = $row['layergroup_name'].".".$row['layer_name'];
 			$_SESSION['GISCLIENT_USER_LAYER'][$row['project_name']][$featureType] = array('WMS'=>$row['wms'],'WFS'=>$row['wfs'],'WFST'=>$row['wfst']);
@@ -149,10 +150,17 @@ abstract class AbstractUser {
 			// create arrays if not exists
 			if(!isset($this->mapLayers[$row['theme_name']])) $this->mapLayers[$row['theme_name']] = array();
 			if(!isset($this->mapLayers[$row['theme_name']][$row['layergroup_name']])) $this->mapLayers[$row['theme_name']][$row['layergroup_name']] = array();
-            if($row['layergroup_single']==1)
-			    $this->mapLayers[$row['theme_name']][$row['layergroup_name']] = array("name" => $row['layergroup_name'], "title" => $row['layergroup_title'], "grouptitle" => $row['layergroup_title']);
-            else
-    			array_push($this->mapLayers[$row['theme_name']][$row['layergroup_name']], array("name" => $featureType, "title" => $row['layer_title']?$row['layer_title']:$row['layer_name'], "grouptitle" => $row['layergroup_title'], "minScale" => $row['minscale'], "maxScale" => $row['maxscale'], "hidden" => $row['hidden']));
+            //if($row['layergroup_single']==1)
+	//		    $this->mapLayers[$row['theme_name']][$row['layergroup_name']] = array("name" => $row['layergroup_name'], "title" => $row['layergroup_title'], "grouptitle" => $row['layergroup_title']);
+          //  else
+    			array_push($this->mapLayers[$row['theme_name']][$row['layergroup_name']], 
+                                    array(  "name"      => $featureType, 
+                                            "index"     => $indexCount++,
+                                            "title"     => $row['layer_title']?$row['layer_title']:$row['layer_name'], 
+                                            "grouptitle"=> $row['layergroup_title'], 
+                                            "minScale"  => $row['minscale'], 
+                                            "maxScale"  => $row['maxscale'], 
+                                            "hidden"    => $row['hidden']));
 
 
             //array_push($this->mapLayers[$row['theme_name']][$row['layergroup_name']], $featureType);

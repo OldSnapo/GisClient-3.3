@@ -127,7 +127,7 @@ class gcMapfile{
 		INNER JOIN ".DB_SCHEMA.".theme using (theme_id)
 		INNER JOIN ".DB_SCHEMA.".project using (project_name) ".$joinMapset."
 		LEFT JOIN ".DB_SCHEMA.".e_outputformat using (outputformat_id)
-		where ".$filter." order by layer_order,layergroup_order;";	
+		where ".$filter." order by layer_order,layergroup_order,layer.layer_name,layergroup.layergroup_name;";	
 
 		print_debug($sql,null,'writemap');
 
